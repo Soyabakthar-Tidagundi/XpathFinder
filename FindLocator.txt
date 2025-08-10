@@ -1,0 +1,238 @@
+package StepDefinitions;
+
+import org.openqa.selenium.*;
+import org.openqa.selenium.chrome.ChromeDriver;
+import org.openqa.selenium.chrome.ChromeOptions;
+
+import java.awt.*;
+import java.awt.datatransfer.StringSelection;
+
+public class UniqueXPathGenerator {
+
+    public static void main(String[] args) throws InterruptedException {
+        // Optional: specify ChromeDriver path if not in PATH
+        // System.setProperty("webdriver.chrome.driver", "/path/to/chromedriver");
+
+        ChromeOptions options = new ChromeOptions();
+        options.addArguments("--start-maximized");
+        WebDriver driver = new ChromeDriver(options);
+
+        try {
+            driver.get("https://www.amazon.in/");
+            Thread.sleep(3000);
+
+            injectClickListener(driver);
+            System.out.println("🖱 Click any element on the page within 15 seconds...");
+
+            WebElement clickedElement = waitForClick(driver, 15_000);
+            if (clickedElement == null) {
+                System.out.println("❌ No element was selected within timeout.");
+                return;
+            }
+
+            String uniqueXPath = generateUniqueXPath(driver, clickedElement);
+            System.out.println("✅ Unique XPath:\n" + uniqueXPath);
+
+            copyToClipboard(uniqueXPath);
+            System.out.println("📋 XPath copied to clipboard!");
+
+        } finally {
+            Thread.sleep(2000);
+            driver.quit();
+        }
+    }
+
+    /**
+     * Inject JS click listener into page that captures and highlights the clicked element
+     */
+    private static void injectClickListener(WebDriver driver) {
+        String script = """
+            window._clickedElement = null;
+            document.body.style.cursor = 'crosshair';
+            document.addEventListener('click', function handler(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                window._clickedElement = e.target;
+                e.target.style.outline = '3px solid red';
+                document.body.style.cursor = 'default';
+                document.removeEventListener('click', handler, true);
+            }, true);
+            """;
+        ((JavascriptExecutor) driver).executeScript(script);
+    }
+
+    /**
+     * Poll for user click on page setting window._clickedElement by JS injected listener
+     * Timeout in milliseconds
+     */
+    private static WebElement waitForClick(WebDriver driver, int timeoutMs) throws InterruptedException {
+        int intervalMs = 500;
+        int waited = 0;
+
+        while (waited < timeoutMs) {
+            Object el = ((JavascriptExecutor) driver).executeScript("return window._clickedElement;");
+            if (el instanceof WebElement) {
+                return (WebElement) el;
+            }
+            Thread.sleep(intervalMs);
+            waited += intervalMs;
+        }
+        return null;
+    }
+
+    /**
+     * Generate robust unique XPath for the given element
+     */
+    private static String generateUniqueXPath(WebDriver driver, WebElement element) {
+        String tag = element.getTagName();
+        String id = element.getAttribute("id");
+        String name = element.getAttribute("name");
+        String type = element.getAttribute("type");
+        String dataTest = element.getAttribute("data-test");
+        if (dataTest == null) dataTest = "";
+
+        // 1) Use unique ID if available
+        if (id != null && !id.isEmpty()) {
+            return "//*[@id=" + escape(id) + "]";
+        }
+
+        // 2) Use combination of meaningful attributes if unique
+        if ((name != null && !name.isEmpty()) || (type != null && !type.isEmpty()) || !dataTest.isEmpty()) {
+            StringBuilder xpath = new StringBuilder("//" + tag + "[");
+            boolean added = false;
+            if (name != null && !name.isEmpty()) {
+                xpath.append("@name=").append(escape(name));
+                added = true;
+            }
+            if (type != null && !type.isEmpty()) {
+                if (added) xpath.append(" and ");
+                xpath.append("@type=").append(escape(type));
+                added = true;
+            }
+            if (!dataTest.isEmpty()) {
+                if (added) xpath.append(" and ");
+                xpath.append("@data-test=").append(escape(dataTest));
+            }
+            xpath.append("]");
+            if (isXPathUnique(driver, xpath.toString())) {
+                return xpath.toString();
+            }
+        }
+
+        // 3) Use short normalized text if unique
+        String text = (String) ((JavascriptExecutor) driver)
+                .executeScript("return arguments[0].textContent.trim().replace(/\\s+/g, ' ');", element);
+        if (text != null && !text.isEmpty() && text.length() < 50) {
+            String xpathText = "//" + tag + "[normalize-space(text())=" + escape(text) + "]";
+            if (isXPathUnique(driver, xpathText)) {
+                return xpathText;
+            }
+        }
+
+        // 4) Use parent context if parent id is unique
+        WebElement parent = getParent(driver, element);
+        if (parent != null) {
+            String parentId = parent.getAttribute("id");
+            if (parentId != null && !parentId.isEmpty()) {
+                int idx = getElementIndexAmongSiblings(driver, element);
+                String xpath = "//*[@id=" + escape(parentId) + "]/" + tag + "[" + idx + "]";
+                if (isXPathUnique(driver, xpath)) {
+                    return xpath;
+                }
+            }
+        }
+
+        // 5) Fallback: full absolute XPath with indexes
+        return buildAbsoluteXPathWithIndexing(driver, element);
+    }
+
+    /**
+     * Checks XPath uniqueness by counting matched elements
+     */
+    private static boolean isXPathUnique(WebDriver driver, String xpath) {
+        // Escape XPath inside JS string by replacing backslash and single quotes, if needed
+        String safeXPathForJS = xpath.replace("\\", "\\\\").replace("'", "\\'");
+        String script = "return document.evaluate('count(" + safeXPathForJS + ")', document, null, XPathResult.NUMBER_TYPE, null).numberValue;";
+        Object result = ((JavascriptExecutor) driver).executeScript(script);
+        if (result instanceof Double) {
+            return ((Double) result).intValue() == 1;
+        } else if (result instanceof Long) {
+            return ((Long) result).intValue() == 1;
+        }
+        return false;
+    }
+
+    /**
+     * Properly escape strings for XPath literals considering single quotes
+     * Uses XPath concat() for strings with single quote inside
+     */
+    private static String escape(String input) {
+        if (input == null || input.isEmpty()) return "''";
+        if (!input.contains("'")) {
+            return "'" + input + "'";
+        }
+        String[] parts = input.split("'");
+        StringBuilder sb = new StringBuilder("concat(");
+        for (int i = 0; i < parts.length; i++) {
+            sb.append("'").append(parts[i]).append("'");
+            if (i < parts.length - 1) {
+                sb.append(", \"'\", ");
+            }
+        }
+        sb.append(")");
+        return sb.toString();
+    }
+
+    /**
+     * Get parent element of given element or null if none exists
+     */
+    private static WebElement getParent(WebDriver driver, WebElement el) {
+        Object parent = ((JavascriptExecutor) driver).executeScript(
+                "return (arguments[0].parentNode && arguments[0].parentNode.nodeType === 1) ? arguments[0].parentNode : null;", el);
+        return (parent instanceof WebElement) ? (WebElement) parent : null;
+    }
+
+    /**
+     * Get 1-based index of element among siblings with same tag name
+     */
+    private static int getElementIndexAmongSiblings(WebDriver driver, WebElement element) {
+        Object idx = ((JavascriptExecutor) driver).executeScript(
+                "let el = arguments[0], i = 1;" +
+                "while(el.previousElementSibling) {" +
+                "  el = el.previousElementSibling;" +
+                "  if(el.tagName === arguments[0].tagName) i++;" +
+                "}" +
+                "return i;", element);
+        if (idx instanceof Long) return ((Long) idx).intValue();
+        if (idx instanceof Double) return ((Double) idx).intValue();
+        return 1;
+    }
+
+    /**
+     * Builds absolute XPath by traversing up DOM tree with sibling indexing
+     */
+    private static String buildAbsoluteXPathWithIndexing(WebDriver driver, WebElement element) {
+        StringBuilder xpath = new StringBuilder();
+        WebElement current = element;
+        while (current != null) {
+            String tag = current.getTagName();
+            int index = getElementIndexAmongSiblings(driver, current);
+            xpath.insert(0, "/" + tag + "[" + index + "]");
+            current = getParent(driver, current);
+        }
+        return xpath.toString();
+    }
+
+    /**
+     * Copies the text to the system clipboard
+     */
+    private static void copyToClipboard(String text) {
+        try {
+            Toolkit.getDefaultToolkit()
+                    .getSystemClipboard()
+                    .setContents(new StringSelection(text), null);
+        } catch (Exception e) {
+            System.err.println("⚠️ Could not copy to clipboard: " + e.getMessage());
+        }
+    }
+}
